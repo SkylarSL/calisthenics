@@ -1,10 +1,13 @@
 import type { NextConfig } from "next";
 
-const NextConfig = {
+/** @type {import('next').NextConfig} */
+const nextConfig = {
   output: "export",
-  trailingSlash: true, // avoids 404s on GitHub Pages' static file routing
-  basePath: "/your-repo-name", // only needed for project pages (see note below)
-  images: { unoptimized: true }, // harmless even though this app doesn't use next/image
+  trailingSlash: true,
+  basePath: "/calisthenics", // replace with your actual repo name, e.g. "/calisthenics-skill-tree"
+  images: {
+    unoptimized: true,
+  },
 };
 
-module.exports = NextConfig;
+module.exports = nextConfig;
