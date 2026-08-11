@@ -78,13 +78,29 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
     return "idle";
   }
 
-  // --- Pan / drag-to-move ---------------------------------------------
+  // --- Pan / zoom / drag-to-move -----------------------------------------
+  const MIN_ZOOM = 0.4;
+  const MAX_ZOOM = 2.5;
+  const clampZoom = (z: number) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z));
+
   const canvasRef = useRef<HTMLDivElement>(null);
   const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [zoom, setZoom] = useState(1);
   const [isDragging, setIsDragging] = useState(false);
+
+  // Tracks every currently-active pointer (finger/mouse) by id, so we can
+  // tell a single-finger pan apart from a two-finger pinch.
+  const pointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const dragging = useRef(false);
-  const draggedRef = useRef(false); // did this press move enough to count as a drag?
+  const draggedRef = useRef(false); // did this gesture move enough to count as a drag (vs. a tap)?
   const lastPoint = useRef({ x: 0, y: 0 });
+  const pendingClickIdRef = useRef<string | null>(null); // node under the finger/cursor at pointerdown
+  const pinchRef = useRef<{
+    distance: number;
+    zoom: number;
+    pan: { x: number; y: number };
+    midpoint: { x: number; y: number };
+  } | null>(null);
 
   // Center the graph in the viewport on mount / whenever its size changes.
   useEffect(() => {
@@ -102,59 +118,194 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
     if (!el) return;
     const rect = el.getBoundingClientRect();
     setPan({ x: (rect.width - width) / 2, y: (rect.height - height) / 2 });
+    setZoom(1);
+  }
+
+  // Re-centers the view on a single node, e.g. after picking it from search
+  // (a click on the graph itself doesn't need this — the node's already on
+  // screen since that's what was clicked).
+  function centerOnNode(id: string) {
+    const pos = positions.get(id);
+    const el = canvasRef.current;
+    if (!pos || !el) return;
+    const rect = el.getBoundingClientRect();
+    setPan({ x: rect.width / 2 - pos.x * zoom, y: rect.height / 2 - pos.y * zoom });
+  }
+
+  function pointerDistance(a: { x: number; y: number }, b: { x: number; y: number }) {
+    return Math.hypot(a.x - b.x, a.y - b.y);
+  }
+  function pointerMidpoint(a: { x: number; y: number }, b: { x: number; y: number }) {
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  }
+
+  // Applies a new zoom level while keeping whatever content is under
+  // `screenX, screenY` (in viewport coordinates) visually anchored in place,
+  // rather than the graph jumping around as it scales.
+  function zoomAround(screenX: number, screenY: number, newZoom: number, fromPan: { x: number; y: number }, fromZoom: number) {
+    const el = canvasRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const localX = screenX - rect.left;
+    const localY = screenY - rect.top;
+    const contentX = (localX - fromPan.x) / fromZoom;
+    const contentY = (localY - fromPan.y) / fromZoom;
+    setPan({ x: localX - contentX * newZoom, y: localY - contentY * newZoom });
+    setZoom(newZoom);
+  }
+
+  // For the +/- buttons -- zooms toward the center of the canvas.
+  function zoomStep(factor: number) {
+    const el = canvasRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    zoomAround(
+      rect.left + rect.width / 2,
+      rect.top + rect.height / 2,
+      clampZoom(zoom * factor),
+      pan,
+      zoom
+    );
   }
 
   function handlePointerDown(e: React.PointerEvent<HTMLDivElement>) {
     e.preventDefault(); // stop the browser from starting a text/image drag-select
-    dragging.current = true;
-    draggedRef.current = false;
-    lastPoint.current = { x: e.clientX, y: e.clientY };
-    // Note: we deliberately do NOT call setPointerCapture here. Capturing
-    // immediately on every press causes the browser to redirect the
-    // resulting mouseup/click to the capturing element instead of whatever
-    // was actually under the pointer — which silently breaks node clicks.
-    // We only capture once real dragging is confirmed, in handlePointerMove.
+    // Capture immediately (not deferred) -- on touch devices, waiting even a
+    // few pixels of movement before capturing lets the OS's own scroll/pan
+    // gesture recognizer steal the touch sequence first, which is why drags
+    // used to die right after starting on mobile. Clicks still work despite
+    // capturing immediately because we hit-test for the tapped node
+    // ourselves below rather than relying on the browser's native click
+    // event (which capture would otherwise redirect to this container).
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // no-op
+    }
+    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (pointersRef.current.size === 1) {
+      dragging.current = true;
+      draggedRef.current = false;
+      lastPoint.current = { x: e.clientX, y: e.clientY };
+      const target = e.target as Element;
+      const nodeEl = target.closest?.("[data-node-id]");
+      pendingClickIdRef.current = nodeEl?.getAttribute("data-node-id") ?? null;
+      setIsDragging(true);
+    } else if (pointersRef.current.size === 2) {
+      // A second finger joined -- this is now a pinch, not a pan or a tap.
+      dragging.current = false;
+      draggedRef.current = true;
+      pendingClickIdRef.current = null;
+      const pts = [...pointersRef.current.values()];
+      pinchRef.current = {
+        distance: pointerDistance(pts[0], pts[1]),
+        zoom,
+        pan,
+        midpoint: pointerMidpoint(pts[0], pts[1]),
+      };
+    }
   }
 
   function handlePointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    if (!pointersRef.current.has(e.pointerId)) return;
+    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (pointersRef.current.size >= 2 && pinchRef.current) {
+      const pts = [...pointersRef.current.values()].slice(0, 2);
+      const distance = pointerDistance(pts[0], pts[1]);
+      const scaleRatio = distance / (pinchRef.current.distance || 1);
+      const newZoom = clampZoom(pinchRef.current.zoom * scaleRatio);
+      zoomAround(
+        pinchRef.current.midpoint.x,
+        pinchRef.current.midpoint.y,
+        newZoom,
+        pinchRef.current.pan,
+        pinchRef.current.zoom
+      );
+      return;
+    }
+
     if (!dragging.current) return;
     const dx = e.clientX - lastPoint.current.x;
     const dy = e.clientY - lastPoint.current.y;
-    if (Math.abs(dx) + Math.abs(dy) > DRAG_THRESHOLD) {
-      if (!draggedRef.current) {
-        // Movement just crossed the threshold: this is now a genuine drag.
-        // Capture from here on so the rest of the gesture tracks smoothly
-        // even if the pointer leaves the canvas element.
-        draggedRef.current = true;
-        setIsDragging(true);
-        try {
-          e.currentTarget.setPointerCapture(e.pointerId);
-        } catch {
-          // no-op: capture is a nice-to-have, not required for panning to work
-        }
-      }
-    }
+    if (Math.abs(dx) + Math.abs(dy) > DRAG_THRESHOLD) draggedRef.current = true;
     lastPoint.current = { x: e.clientX, y: e.clientY };
     setPan((p) => ({ x: p.x + dx, y: p.y + dy }));
   }
 
   function endDrag(e: React.PointerEvent<HTMLDivElement>) {
-    dragging.current = false;
-    setIsDragging(false);
+    pointersRef.current.delete(e.pointerId);
     try {
       e.currentTarget.releasePointerCapture(e.pointerId);
     } catch {
       // no-op: pointer may not be captured
     }
+
+    if (pointersRef.current.size >= 2) {
+      // Still pinching with the remaining fingers -- nothing else to do.
+      return;
+    }
+
+    if (pointersRef.current.size === 1) {
+      // One finger lifted out of a pinch; the remaining finger continues as
+      // a pan from here, not a tap.
+      pinchRef.current = null;
+      dragging.current = true;
+      draggedRef.current = true;
+      lastPoint.current = [...pointersRef.current.values()][0];
+      return;
+    }
+
+    // Last pointer lifted.
+    pinchRef.current = null;
+    dragging.current = false;
+    setIsDragging(false);
+    if (!draggedRef.current && pendingClickIdRef.current) {
+      handleNodeClick(pendingClickIdRef.current);
+    }
+    pendingClickIdRef.current = null;
   }
 
-  function handleNodeClickGuarded(id: string) {
-    if (draggedRef.current) return; // this was a pan, not a click
-    handleNodeClick(id);
-  }
+  // Trackpad pinch-to-zoom arrives as wheel events with ctrlKey set (this is
+  // how browsers report it, even though no keyboard key is actually held).
+  // A native (non-React) listener with { passive: false } is required here
+  // -- React attaches onWheel as a passive listener for scroll performance,
+  // which would silently prevent preventDefault() from stopping the
+  // browser's own page-zoom behavior.
+  //
+  // The listener is registered once (empty deps) so it isn't torn down and
+  // re-attached on every pan/zoom change, so it reads current pan/zoom via
+  // refs (kept in sync below) rather than closing over state directly.
+  const panRef = useRef(pan);
+  const zoomRef = useRef(zoom);
+  useEffect(() => {
+    panRef.current = pan;
+  }, [pan]);
+  useEffect(() => {
+    zoomRef.current = zoom;
+  }, [zoom]);
+
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    function handleWheel(e: WheelEvent) {
+      if (!e.ctrlKey) return; // plain scroll -- leave it alone
+      e.preventDefault();
+      const currentZoom = zoomRef.current;
+      const newZoom = clampZoom(currentZoom * Math.exp(-e.deltaY * 0.01));
+      zoomAround(e.clientX, e.clientY, newZoom, panRef.current, currentZoom);
+    }
+    el.addEventListener("wheel", handleWheel, { passive: false });
+    return () => el.removeEventListener("wheel", handleWheel);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
 
   // Left sidebar (prerequisite details) open/collapsed state.
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  // Legend + category colour key, also collapsed by default to save space.
+  const [legendOpen, setLegendOpen] = useState(false);
 
   // Ordered earliest -> latest, ending with the selected exercise itself --
   // used to drive the sidebar's title + description list.
@@ -172,17 +323,6 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
     if (!q) return [];
     return nodes.filter((n) => n.exercise.toLowerCase().includes(q)).slice(0, 8);
   }, [nodes, searchQuery]);
-
-  // Re-centers the view on a single node, e.g. after picking it from search
-  // (a click on the graph itself doesn't need this — the node's already on
-  // screen since that's what was clicked).
-  function centerOnNode(id: string) {
-    const pos = positions.get(id);
-    const el = canvasRef.current;
-    if (!pos || !el) return;
-    const rect = el.getBoundingClientRect();
-    setPan({ x: rect.width / 2 - pos.x, y: rect.height / 2 - pos.y });
-  }
 
   function selectFromSearch(id: string) {
     setSelected(id);
@@ -299,11 +439,13 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={endDrag}
+        onPointerCancel={endDrag}
         onPointerLeave={endDrag}
       >
         <div
           style={{
-            transform: `translate(${pan.x}px, ${pan.y}px)`,
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            transformOrigin: "0 0",
             width,
             height,
           }}
@@ -374,6 +516,7 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
                 return (
                   <g
                     key={n.id}
+                    data-node-id={n.id}
                     className={isHighlighted ? "st-node-group st-node-glow" : "st-node-group"}
                     style={isHighlighted ? ({ "--glow-color": category.stroke } as React.CSSProperties) : undefined}
                     tabIndex={0}
@@ -382,7 +525,6 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
                     transform={`translate(${pos.x - nodeWidth / 2}, ${
                       pos.y - nodeHeight / 2
                     })`}
-                    onClick={() => handleNodeClickGuarded(n.id)}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
@@ -430,8 +572,9 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
         </div>
       </div>
 
-      {/* Title, floating top-center */}
-      <div className="pointer-events-none absolute left-1/2 top-6 z-10 -translate-x-1/2 text-center">
+      {/* Title, floating top-center. Hidden on mobile -- both panels go
+          full-width there and would sit right on top of it anyway. */}
+      <div className="pointer-events-none absolute left-1/2 top-6 z-10 hidden -translate-x-1/2 text-center sm:block">
         <h2 className="st-display text-2xl uppercase sm:text-3xl">
           Skill Tree
         </h2>
@@ -441,9 +584,11 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
         </p>
       </div>
 
-      {/* Prerequisite details, dropdown-style sidebar floating on the left */}
+      {/* Prerequisite details, dropdown-style sidebar floating on the left.
+          Full-width on mobile (stacked above the info panel below), a fixed
+          width pinned to the corner from the sm breakpoint up. */}
       <div
-        className="absolute left-4 top-4 z-10 flex max-h-[calc(100vh-2rem)] w-80 flex-col rounded-xl border shadow-2xl backdrop-blur"
+        className="absolute left-4 right-4 top-4 z-20 flex max-h-[70vh] flex-col rounded-xl border shadow-2xl backdrop-blur sm:right-auto sm:max-h-[calc(100vh-2rem)] sm:w-80"
         style={{
           background: "rgba(26, 30, 34, 0.85)",
           borderColor: "#262b31",
@@ -519,19 +664,46 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
         )}
       </div>
 
-      {/* Info overlay, floating top-right */}
+      {/* Info overlay. Full-width and stacked below the prerequisites panel
+          on mobile (which is ~52px tall collapsed), pinned to the top-right
+          corner with a fixed width from the sm breakpoint up. */}
       <div
-        className="absolute right-4 top-4 z-10 flex max-h-[calc(100vh-2rem)] w-72 flex-col gap-4 overflow-y-auto rounded-xl border p-4 shadow-2xl backdrop-blur"
+        className="absolute left-4 right-4 top-20 z-10 flex max-h-[60vh] flex-col gap-4 overflow-y-auto rounded-xl border p-4 shadow-2xl backdrop-blur sm:left-auto sm:top-4 sm:max-h-[calc(100vh-2rem)] sm:w-72"
         style={{
           background: "rgba(26, 30, 34, 0.85)",
           borderColor: "#262b31",
         }}
       >
-        <div className="flex items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="st-mono text-xs uppercase tracking-wider" style={{ color: "#8b929b" }}>
             View
           </span>
-          <div className="flex gap-2">
+          <div className="flex items-center gap-2">
+            <div
+              className="st-mono flex items-center overflow-hidden rounded-md border text-[10px]"
+              style={{ borderColor: "#3a4048", color: "#8b929b" }}
+            >
+              <button
+                onClick={() => zoomStep(1 / 1.3)}
+                aria-label="Zoom out"
+                className="px-2 py-1 transition-colors hover:bg-[#1e2227]"
+              >
+                −
+              </button>
+              <span
+                className="border-x px-1.5 py-1 tabular-nums"
+                style={{ borderColor: "#3a4048" }}
+              >
+                {Math.round(zoom * 100)}%
+              </span>
+              <button
+                onClick={() => zoomStep(1.3)}
+                aria-label="Zoom in"
+                className="px-2 py-1 transition-colors hover:bg-[#1e2227]"
+              >
+                +
+              </button>
+            </div>
             <button
               onClick={resetView}
               className="st-mono rounded-md border px-2.5 py-1 text-[10px] uppercase tracking-wide transition-colors hover:bg-[#1e2227]"
@@ -625,40 +797,59 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
         </div>
 
         <div className="border-t pt-4" style={{ borderColor: "#262b31" }}>
-          <h3
-            className="st-mono text-xs uppercase tracking-wider"
+          <button
+            onClick={() => setLegendOpen((open) => !open)}
+            aria-expanded={legendOpen}
+            className="st-mono flex w-full items-center justify-between gap-2 text-xs uppercase tracking-wider transition-colors"
             style={{ color: "#8b929b" }}
           >
             Legend
-          </h3>
-          <p className="mt-1 text-xs" style={{ color: "#5b6169" }}>
-            Selected and prerequisite exercises glow in their own category
-            colour.
-          </p>
-          <div className="mt-2 flex flex-col gap-1.5 text-xs" style={{ color: "#8b929b" }}>
-            <LegendRow color="#f5f5f4" label="Prerequisite path" />
-            <LegendRow color="#3a4048" label="Not relevant" />
-          </div>
-        </div>
+            <span
+              aria-hidden
+              style={{
+                display: "inline-block",
+                transition: "transform 160ms ease",
+                transform: legendOpen ? "rotate(180deg)" : "rotate(0deg)",
+              }}
+            >
+              ▾
+            </span>
+          </button>
 
-        <div className="border-t pt-4" style={{ borderColor: "#262b31" }}>
-          <h3
-            className="st-mono text-xs uppercase tracking-wider"
-            style={{ color: "#8b929b" }}
-          >
-            Categories
-          </h3>
-          <div className="mt-2 grid grid-cols-2 gap-1.5 text-xs" style={{ color: "#8b929b" }}>
-            {(Object.keys(COLOUR_STYLES) as Array<keyof typeof COLOUR_STYLES>).map(
-              (colour) => (
-                <LegendRow
-                  key={colour}
-                  color={COLOUR_STYLES[colour].stroke}
-                  label={COLOUR_LABELS[colour]}
-                />
-              )
-            )}
-          </div>
+          {legendOpen && (
+            <div className="mt-3 flex flex-col gap-4">
+              <div>
+                <p className="text-xs" style={{ color: "#5b6169" }}>
+                  Selected and prerequisite exercises glow in their own
+                  category colour.
+                </p>
+                <div className="mt-2 flex flex-col gap-1.5 text-xs" style={{ color: "#8b929b" }}>
+                  <LegendRow color="#f5f5f4" label="Prerequisite path" />
+                  <LegendRow color="#3a4048" label="Not relevant" />
+                </div>
+              </div>
+
+              <div>
+                <h4
+                  className="st-mono text-xs uppercase tracking-wider"
+                  style={{ color: "#8b929b" }}
+                >
+                  Categories
+                </h4>
+                <div className="mt-2 grid grid-cols-2 gap-1.5 text-xs" style={{ color: "#8b929b" }}>
+                  {(Object.keys(COLOUR_STYLES) as Array<keyof typeof COLOUR_STYLES>).map(
+                    (colour) => (
+                      <LegendRow
+                        key={colour}
+                        color={COLOUR_STYLES[colour].stroke}
+                        label={COLOUR_LABELS[colour]}
+                      />
+                    )
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>

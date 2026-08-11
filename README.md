@@ -117,6 +117,49 @@ category colours live in a translucent panel floating in the top-right
 corner; the prerequisite descriptions live in their own collapsible panel
 on the left — both float above the graph so neither blocks it.
 
+## Mobile / responsive layout
+
+Below the `sm` breakpoint (640px), both floating panels switch from
+corner-pinned fixed widths to full-width bars stacked at the top of the
+screen — the prerequisites panel first, then the info panel (search,
+selection, legend) below it, since two ~300px panels side by side simply
+don't fit on a phone screen. The decorative title is hidden on mobile to
+free up space, since both panels would otherwise render on top of it
+anyway. The legend + category colour key collapses into its own dropdown
+(same pattern as the prerequisites panel) so it doesn't take up space until
+you actually want it.
+
+One known tradeoff: if you expand the prerequisites dropdown on a small
+screen, it can grow tall enough to visually sit on top of the info panel
+below it (it's given a higher z-index specifically so it overlaps *on top*
+of the info panel rather than being clipped behind it) — both stay
+independently scrollable and functional, it's just not a perfectly
+non-overlapping layout in that specific combination.
+
+**Touch dragging**: panning uses the Pointer Events API (`onPointerDown`
+/`onPointerMove`/`onPointerUp`), which unifies mouse and touch input, so no
+separate touch-specific handling is needed for the pan gesture itself.
+Pointer capture is grabbed immediately on press rather than only once a
+drag is detected — capturing late lets the OS's own scroll/pan gesture
+recognizer steal the touch sequence first on most mobile browsers, which is
+what caused drags to die a few pixels into the gesture. Because capture is
+now immediate, clicks are detected by hit-testing which node (if any) was
+under the pointer at press time (via a `data-node-id` attribute) rather
+than relying on the browser's native `click` event — pointer capture
+redirects `click` to the capturing element, so the old click-vs-drag logic
+would silently break tapping nodes if capture happened immediately.
+
+**Pinch/zoom**: two-finger pinch (tracked via multiple simultaneous
+pointer ids) zooms the canvas in and out, anchored so whatever's under your
+fingers stays under your fingers rather than the graph jumping around.
+Trackpad pinch on desktop works the same way — browsers report it as a
+`wheel` event with `ctrlKey` set, handled via a native (non-passive) event
+listener so `preventDefault()` can actually stop the browser's own
+page-zoom. Plain mouse-wheel scrolling is left alone. Zoom is clamped
+between 40% and 250%, with `+`/`−` buttons and a live percentage readout in
+the "View" section of the info panel for mouse-only users, and "Recenter"
+resets both pan and zoom back to fitting the whole graph on screen.
+
 ## Deploying to GitHub Pages
 
 This app has no server dependencies (no API routes, no data fetching), so
