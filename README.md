@@ -96,12 +96,9 @@ arrow keys, and press Enter or click a result to select it. Selecting from
 search also pans the canvas so the exercise is centered in view, since it
 might currently be off-screen.
 
-The collapsible sidebar on the left lists every prerequisite for the
-current selection, ordered from the earliest root movement up through the
-selected exercise itself, each with its `description` underneath. It's a
-scrollable dropdown, collapsed by default — click the "Prerequisites"
-header (or select an exercise, which opens it automatically) to reveal the
-list; click the header again to collapse it.
+The same panel also lists every prerequisite for the current selection
+under "Prerequisites", ordered from the earliest root movement up through
+the selected exercise itself, each with its `description` underneath.
 
 ## Design notes
 
@@ -111,43 +108,35 @@ selecting an exercise doesn't swap that colour out, it makes the relevant
 nodes glow (a coloured drop-shadow driven by each node's own hue) while the
 connecting edges turn white with an animated flowing dash, and everything
 unrelated dims to grey. The graph fills the whole viewport and can be
-dragged around with the mouse (or touch) to pan; a "Recenter" button in the
-overlay snaps it back to the middle. Selection, search, the legend, and
-category colours live in a translucent panel floating in the top-right
-corner; the prerequisite descriptions live in their own collapsible panel
-on the left — both float above the graph so neither blocks it.
+dragged around with the mouse (or touch) to pan, and pinch/scroll-zoomed;
+a "Recenter" button in the panel resets both pan and zoom. Everything —
+view controls, search, selection, prerequisites, and the legend — lives in
+one translucent panel floating in the top-right corner, above the graph so
+it never blocks it.
 
 ## Mobile / responsive layout
 
-Below the `sm` breakpoint (640px), both floating panels switch from
-corner-pinned fixed widths to full-width bars stacked at the top of the
-screen — the prerequisites panel first, then the info panel (search,
-selection, legend) below it, since two ~300px panels side by side simply
-don't fit on a phone screen. The decorative title is hidden on mobile to
-free up space, since both panels would otherwise render on top of it
-anyway. The legend + category colour key collapses into its own dropdown
-(same pattern as the prerequisites panel) so it doesn't take up space until
-you actually want it.
+Below the `sm` breakpoint (640px), the info panel becomes a hamburger
+menu: a small "☰" button in the top-right corner opens it as a near
+full-screen drawer (same content as the desktop panel, just laid out for a
+phone), with a "✕" to close it. Selecting an exercise (from the graph or
+search) opens the drawer automatically so you immediately see its
+prerequisites, without needing an extra tap. The decorative subtitle under
+the title is hidden on mobile to save space; the "Skill Tree" heading
+itself stays visible at both sizes.
 
-One known tradeoff: if you expand the prerequisites dropdown on a small
-screen, it can grow tall enough to visually sit on top of the info panel
-below it (it's given a higher z-index specifically so it overlaps *on top*
-of the info panel rather than being clipped behind it) — both stay
-independently scrollable and functional, it's just not a perfectly
-non-overlapping layout in that specific combination.
-
-**Touch dragging**: panning uses the Pointer Events API (`onPointerDown`
-/`onPointerMove`/`onPointerUp`), which unifies mouse and touch input, so no
-separate touch-specific handling is needed for the pan gesture itself.
-Pointer capture is grabbed immediately on press rather than only once a
-drag is detected — capturing late lets the OS's own scroll/pan gesture
-recognizer steal the touch sequence first on most mobile browsers, which is
-what caused drags to die a few pixels into the gesture. Because capture is
-now immediate, clicks are detected by hit-testing which node (if any) was
-under the pointer at press time (via a `data-node-id` attribute) rather
-than relying on the browser's native `click` event — pointer capture
-redirects `click` to the capturing element, so the old click-vs-drag logic
-would silently break tapping nodes if capture happened immediately.
+**Touch dragging**: panning uses the Pointer Events API, which unifies
+mouse and touch input. Drag/pinch tracking is done via window-level
+`pointermove`/`pointerup`/`pointercancel` listeners (registered once, keyed
+by pointer id) rather than the Pointer Capture API (`setPointerCapture`) —
+capture is spec'd for exactly this kind of thing, but its implementation on
+mobile Safari has long-standing reliability issues where it silently drops
+mid-gesture, which is what caused drags to die a few pixels into the
+gesture. Window-level listeners keep tracking correctly regardless of
+capture. Since there's no captured element to redirect events, taps are
+detected by hit-testing which node (if any) was under the pointer at press
+time (via a `data-node-id` attribute) rather than relying on the browser's
+native `click` event.
 
 **Pinch/zoom**: two-finger pinch (tracked via multiple simultaneous
 pointer ids) zooms the canvas in and out, anchored so whatever's under your
@@ -157,8 +146,7 @@ Trackpad pinch on desktop works the same way — browsers report it as a
 listener so `preventDefault()` can actually stop the browser's own
 page-zoom. Plain mouse-wheel scrolling is left alone. Zoom is clamped
 between 40% and 250%, with `+`/`−` buttons and a live percentage readout in
-the "View" section of the info panel for mouse-only users, and "Recenter"
-resets both pan and zoom back to fitting the whole graph on screen.
+the "View" section of the info panel for mouse-only users.
 
 ## Deploying to GitHub Pages
 

@@ -69,7 +69,7 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
   function handleNodeClick(id: string) {
     const next = selected === id ? null : id;
     setSelected(next);
-    if (next) setSidebarOpen(true); // reveal details for the new selection
+    if (next) setMenuOpen(true); // reveal details for the new selection (mobile only; no-op visually on desktop)
   }
 
   function nodeState(id: string): NodeState {
@@ -170,18 +170,13 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
 
   function handlePointerDown(e: React.PointerEvent<HTMLDivElement>) {
     e.preventDefault(); // stop the browser from starting a text/image drag-select
-    // Capture immediately (not deferred) -- on touch devices, waiting even a
-    // few pixels of movement before capturing lets the OS's own scroll/pan
-    // gesture recognizer steal the touch sequence first, which is why drags
-    // used to die right after starting on mobile. Clicks still work despite
-    // capturing immediately because we hit-test for the tapped node
-    // ourselves below rather than relying on the browser's native click
-    // event (which capture would otherwise redirect to this container).
-    try {
-      e.currentTarget.setPointerCapture(e.pointerId);
-    } catch {
-      // no-op
-    }
+    // Deliberately NOT using setPointerCapture here. It's spec'd to keep a
+    // gesture routed to one element, but mobile Safari's implementation has
+    // long-standing reliability issues -- capture silently drops mid-drag,
+    // which is exactly the "stops after moving a tiny bit" symptom. Instead,
+    // move/up are handled by window-level listeners below (registered once,
+    // keyed by pointerId), which is the classic, more battle-tested pattern
+    // for custom drag/pan and doesn't depend on capture working at all.
     pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
     if (pointersRef.current.size === 1) {
@@ -207,65 +202,87 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
     }
   }
 
-  function handlePointerMove(e: React.PointerEvent<HTMLDivElement>) {
-    if (!pointersRef.current.has(e.pointerId)) return;
-    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  // handleNodeClick is recreated every render (it closes over `selected`),
+  // but the window listener below is registered once on mount -- without
+  // this ref it would permanently call the very first render's version and
+  // misbehave once `selected` changes. Standard "latest ref" fix.
+  const handleNodeClickRef = useRef(handleNodeClick);
+  useEffect(() => {
+    handleNodeClickRef.current = handleNodeClick;
+  });
 
-    if (pointersRef.current.size >= 2 && pinchRef.current) {
-      const pts = [...pointersRef.current.values()].slice(0, 2);
-      const distance = pointerDistance(pts[0], pts[1]);
-      const scaleRatio = distance / (pinchRef.current.distance || 1);
-      const newZoom = clampZoom(pinchRef.current.zoom * scaleRatio);
-      zoomAround(
-        pinchRef.current.midpoint.x,
-        pinchRef.current.midpoint.y,
-        newZoom,
-        pinchRef.current.pan,
-        pinchRef.current.zoom
-      );
-      return;
+  // Pan, pinch-zoom, and tap detection all live in one window-level
+  // pointermove/pointerup/pointercancel listener set, registered once.
+  // Window-level (rather than only on the canvas element) means the drag
+  // keeps tracking correctly even if a finger slides off the canvas's
+  // bounds mid-gesture, without depending on Pointer Capture at all.
+  useEffect(() => {
+    function onMove(e: PointerEvent) {
+      if (!pointersRef.current.has(e.pointerId)) return;
+      pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+      if (pointersRef.current.size >= 2 && pinchRef.current) {
+        const pts = [...pointersRef.current.values()].slice(0, 2);
+        const distance = pointerDistance(pts[0], pts[1]);
+        const scaleRatio = distance / (pinchRef.current.distance || 1);
+        const newZoom = clampZoom(pinchRef.current.zoom * scaleRatio);
+        zoomAround(
+          pinchRef.current.midpoint.x,
+          pinchRef.current.midpoint.y,
+          newZoom,
+          pinchRef.current.pan,
+          pinchRef.current.zoom
+        );
+        return;
+      }
+
+      if (!dragging.current) return;
+      const dx = e.clientX - lastPoint.current.x;
+      const dy = e.clientY - lastPoint.current.y;
+      if (Math.abs(dx) + Math.abs(dy) > DRAG_THRESHOLD) draggedRef.current = true;
+      lastPoint.current = { x: e.clientX, y: e.clientY };
+      setPan((p) => ({ x: p.x + dx, y: p.y + dy }));
     }
 
-    if (!dragging.current) return;
-    const dx = e.clientX - lastPoint.current.x;
-    const dy = e.clientY - lastPoint.current.y;
-    if (Math.abs(dx) + Math.abs(dy) > DRAG_THRESHOLD) draggedRef.current = true;
-    lastPoint.current = { x: e.clientX, y: e.clientY };
-    setPan((p) => ({ x: p.x + dx, y: p.y + dy }));
-  }
+    function onUp(e: PointerEvent) {
+      if (!pointersRef.current.has(e.pointerId)) return;
+      pointersRef.current.delete(e.pointerId);
 
-  function endDrag(e: React.PointerEvent<HTMLDivElement>) {
-    pointersRef.current.delete(e.pointerId);
-    try {
-      e.currentTarget.releasePointerCapture(e.pointerId);
-    } catch {
-      // no-op: pointer may not be captured
-    }
+      if (pointersRef.current.size >= 2) {
+        // Still pinching with the remaining fingers -- nothing else to do.
+        return;
+      }
 
-    if (pointersRef.current.size >= 2) {
-      // Still pinching with the remaining fingers -- nothing else to do.
-      return;
-    }
+      if (pointersRef.current.size === 1) {
+        // One finger lifted out of a pinch; the remaining finger continues
+        // as a pan from here, not a tap.
+        pinchRef.current = null;
+        dragging.current = true;
+        draggedRef.current = true;
+        lastPoint.current = [...pointersRef.current.values()][0];
+        return;
+      }
 
-    if (pointersRef.current.size === 1) {
-      // One finger lifted out of a pinch; the remaining finger continues as
-      // a pan from here, not a tap.
+      // Last pointer lifted.
       pinchRef.current = null;
-      dragging.current = true;
-      draggedRef.current = true;
-      lastPoint.current = [...pointersRef.current.values()][0];
-      return;
+      dragging.current = false;
+      setIsDragging(false);
+      if (!draggedRef.current && pendingClickIdRef.current) {
+        handleNodeClickRef.current(pendingClickIdRef.current);
+      }
+      pendingClickIdRef.current = null;
     }
 
-    // Last pointer lifted.
-    pinchRef.current = null;
-    dragging.current = false;
-    setIsDragging(false);
-    if (!draggedRef.current && pendingClickIdRef.current) {
-      handleNodeClick(pendingClickIdRef.current);
-    }
-    pendingClickIdRef.current = null;
-  }
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Trackpad pinch-to-zoom arrives as wheel events with ctrlKey set (this is
   // how browsers report it, even though no keyboard key is actually held).
@@ -302,13 +319,12 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
   }, []);
 
 
-  // Left sidebar (prerequisite details) open/collapsed state.
-  const [sidebarOpen, setSidebarOpen] = useState(false);
-  // Legend + category colour key, also collapsed by default to save space.
-  const [legendOpen, setLegendOpen] = useState(false);
+  // Mobile-only: whether the hamburger menu (the info card) is open. Always
+  // visible on desktop regardless of this value.
+  const [menuOpen, setMenuOpen] = useState(false);
 
   // Ordered earliest -> latest, ending with the selected exercise itself --
-  // used to drive the sidebar's title + description list.
+  // used to drive the prerequisites list.
   const sidebarList = useMemo(
     () => (selected ? [...orderedPrereqs, selected] : []),
     [orderedPrereqs, selected]
@@ -326,7 +342,7 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
 
   function selectFromSearch(id: string) {
     setSelected(id);
-    setSidebarOpen(true);
+    setMenuOpen(true);
     centerOnNode(id);
     setSearchQuery("");
     setSearchActiveIndex(0);
@@ -360,6 +376,7 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
       style={{
         background: "#14171a",
         color: "#ededea",
+        overscrollBehavior: "none",
         fontFamily:
           "Inter, ui-sans-serif, system-ui, -apple-system, sans-serif",
       }}
@@ -429,6 +446,7 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
         style={{
           cursor: isDragging ? "grabbing" : "grab",
           touchAction: "none",
+          overscrollBehavior: "none",
           userSelect: "none",
           WebkitUserSelect: "none",
           backgroundImage:
@@ -437,10 +455,6 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
           backgroundPosition: `${pan.x % 28}px ${pan.y % 28}px`,
         }}
         onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={endDrag}
-        onPointerCancel={endDrag}
-        onPointerLeave={endDrag}
       >
         <div
           style={{
@@ -572,108 +586,60 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
         </div>
       </div>
 
-      {/* Title, floating top-center. Hidden on mobile -- both panels go
-          full-width there and would sit right on top of it anyway. */}
-      <div className="pointer-events-none absolute left-1/2 top-6 z-10 hidden -translate-x-1/2 text-center sm:block">
+      {/* Title, floating top-center. Visible on all breakpoints now that
+          there's only one info card competing for space (plus a small
+          hamburger icon on mobile), not two. */}
+      <div className="pointer-events-none absolute left-1/2 top-6 z-10 -translate-x-1/2 text-center">
         <h2 className="st-display text-2xl uppercase sm:text-3xl">
           Skill Tree
         </h2>
-        <p className="mt-1 text-sm" style={{ color: "#8b929b" }}>
-          Drag to move around. Select an exercise — prerequisite details
-          appear in the sidebar.
+        <p className="mt-1 hidden text-sm sm:block" style={{ color: "#8b929b" }}>
+          Drag to move around. Select an exercise to see its prerequisites.
         </p>
       </div>
 
-      {/* Prerequisite details, dropdown-style sidebar floating on the left.
-          Full-width on mobile (stacked above the info panel below), a fixed
-          width pinned to the corner from the sm breakpoint up. */}
+      {/* Hamburger toggle -- mobile only. The info card itself is always
+          rendered; on desktop it's always visible regardless of this
+          button, this only controls whether it's shown on small screens. */}
+      <button
+        onClick={() => setMenuOpen(true)}
+        aria-label="Open menu"
+        className="st-mono absolute right-4 top-4 z-20 flex h-10 w-10 items-center justify-center rounded-xl border text-lg shadow-2xl backdrop-blur sm:hidden"
+        style={{
+          background: "rgba(26, 30, 34, 0.85)",
+          borderColor: "#262b31",
+          color: "#ededea",
+        }}
+      >
+        ☰
+      </button>
+
+      {/* Info card: search/selection, prerequisites, and legend/categories
+          all in one place. Always visible from the sm breakpoint up,
+          pinned to the top-right corner. On mobile it's hidden until the
+          hamburger button opens it, at which point it becomes a near
+          full-screen drawer. */}
       <div
-        className="absolute left-4 right-4 top-4 z-20 flex max-h-[70vh] flex-col rounded-xl border shadow-2xl backdrop-blur sm:right-auto sm:max-h-[calc(100vh-2rem)] sm:w-80"
+        className={`${
+          menuOpen ? "flex" : "hidden"
+        } fixed inset-4 z-30 flex-col gap-4 overflow-y-auto rounded-xl border p-4 shadow-2xl backdrop-blur sm:absolute sm:inset-auto sm:right-4 sm:top-4 sm:z-10 sm:flex sm:max-h-[calc(100vh-2rem)] sm:w-72`}
         style={{
           background: "rgba(26, 30, 34, 0.85)",
           borderColor: "#262b31",
         }}
       >
-        <button
-          onClick={() => setSidebarOpen((open) => !open)}
-          aria-expanded={sidebarOpen}
-          className="st-mono flex shrink-0 items-center justify-between gap-2 p-4 text-xs uppercase tracking-wider transition-colors hover:bg-[#1e2227]"
-          style={{
-            color: "#8b929b",
-            borderBottom: sidebarOpen ? "1px solid #262b31" : "none",
-          }}
-        >
-          Prerequisites
-          <span
-            aria-hidden
-            style={{
-              display: "inline-block",
-              transition: "transform 160ms ease",
-              transform: sidebarOpen ? "rotate(180deg)" : "rotate(0deg)",
-            }}
+        <div className="flex items-center justify-between gap-2 sm:hidden">
+          <span className="st-display text-lg uppercase">Menu</span>
+          <button
+            onClick={() => setMenuOpen(false)}
+            aria-label="Close menu"
+            className="st-mono rounded-md border px-2.5 py-1 text-xs transition-colors hover:bg-[#1e2227]"
+            style={{ borderColor: "#3a4048", color: "#8b929b" }}
           >
-            ▾
-          </span>
-        </button>
+            ✕
+          </button>
+        </div>
 
-        {sidebarOpen && (
-          <div className="overflow-y-auto p-4">
-            {!selected && (
-              <p className="text-sm" style={{ color: "#5b6169" }}>
-                Select an exercise on the graph to see every prerequisite
-                required to reach it, along with a short description of
-                each.
-              </p>
-            )}
-
-            {selected && sidebarList.length === 0 && (
-              <p className="text-sm" style={{ color: "#8b929b" }}>
-                This is a root movement — no prerequisites needed.
-              </p>
-            )}
-
-            {selected && sidebarList.length > 0 && (
-              <div className="flex flex-col gap-5">
-                {sidebarList.map((id) => {
-                  const node = index.byId.get(id);
-                  if (!node) return null;
-                  const isSelectedItem = id === selected;
-                  const category = COLOUR_STYLES[node.colour];
-                  return (
-                    <div key={id}>
-                      <h4
-                        className="text-sm font-semibold"
-                        style={{
-                          color: isSelectedItem ? category.stroke : "#ededea",
-                        }}
-                      >
-                        {toTitleCase(node.exercise)}
-                      </h4>
-                      <p
-                        className="mt-1.5 text-sm leading-relaxed"
-                        style={{ color: "#8b929b" }}
-                      >
-                        {node.description || "No description yet."}
-                      </p>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Info overlay. Full-width and stacked below the prerequisites panel
-          on mobile (which is ~52px tall collapsed), pinned to the top-right
-          corner with a fixed width from the sm breakpoint up. */}
-      <div
-        className="absolute left-4 right-4 top-20 z-10 flex max-h-[60vh] flex-col gap-4 overflow-y-auto rounded-xl border p-4 shadow-2xl backdrop-blur sm:left-auto sm:top-4 sm:max-h-[calc(100vh-2rem)] sm:w-72"
-        style={{
-          background: "rgba(26, 30, 34, 0.85)",
-          borderColor: "#262b31",
-        }}
-      >
         <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="st-mono text-xs uppercase tracking-wider" style={{ color: "#8b929b" }}>
             View
@@ -797,59 +763,91 @@ export default function SkillTree({ nodes = skillTree }: SkillTreeProps) {
         </div>
 
         <div className="border-t pt-4" style={{ borderColor: "#262b31" }}>
-          <button
-            onClick={() => setLegendOpen((open) => !open)}
-            aria-expanded={legendOpen}
-            className="st-mono flex w-full items-center justify-between gap-2 text-xs uppercase tracking-wider transition-colors"
+          <h3
+            className="st-mono text-xs uppercase tracking-wider"
+            style={{ color: "#8b929b" }}
+          >
+            Prerequisites
+          </h3>
+
+          {!selected && (
+            <p className="mt-2 text-sm" style={{ color: "#5b6169" }}>
+              Select an exercise on the graph to see every prerequisite
+              required to reach it, along with a short description of each.
+            </p>
+          )}
+
+          {selected && sidebarList.length === 0 && (
+            <p className="mt-2 text-sm" style={{ color: "#8b929b" }}>
+              This is a root movement — no prerequisites needed.
+            </p>
+          )}
+
+          {selected && sidebarList.length > 0 && (
+            <div className="mt-3 flex flex-col gap-5">
+              {sidebarList.map((id) => {
+                const node = index.byId.get(id);
+                if (!node) return null;
+                const isSelectedItem = id === selected;
+                const category = COLOUR_STYLES[node.colour];
+                return (
+                  <div key={id}>
+                    <h4
+                      className="text-sm font-semibold"
+                      style={{
+                        color: isSelectedItem ? category.stroke : "#ededea",
+                      }}
+                    >
+                      {toTitleCase(node.exercise)}
+                    </h4>
+                    <p
+                      className="mt-1.5 text-sm leading-relaxed"
+                      style={{ color: "#8b929b" }}
+                    >
+                      {node.description || "No description yet."}
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        <div className="border-t pt-4" style={{ borderColor: "#262b31" }}>
+          <h3
+            className="st-mono text-xs uppercase tracking-wider"
             style={{ color: "#8b929b" }}
           >
             Legend
-            <span
-              aria-hidden
-              style={{
-                display: "inline-block",
-                transition: "transform 160ms ease",
-                transform: legendOpen ? "rotate(180deg)" : "rotate(0deg)",
-              }}
-            >
-              ▾
-            </span>
-          </button>
+          </h3>
+          <p className="mt-1 text-xs" style={{ color: "#5b6169" }}>
+            Selected and prerequisite exercises glow in their own category
+            colour.
+          </p>
+          <div className="mt-2 flex flex-col gap-1.5 text-xs" style={{ color: "#8b929b" }}>
+            <LegendRow color="#f5f5f4" label="Prerequisite path" />
+            <LegendRow color="#3a4048" label="Not relevant" />
+          </div>
+        </div>
 
-          {legendOpen && (
-            <div className="mt-3 flex flex-col gap-4">
-              <div>
-                <p className="text-xs" style={{ color: "#5b6169" }}>
-                  Selected and prerequisite exercises glow in their own
-                  category colour.
-                </p>
-                <div className="mt-2 flex flex-col gap-1.5 text-xs" style={{ color: "#8b929b" }}>
-                  <LegendRow color="#f5f5f4" label="Prerequisite path" />
-                  <LegendRow color="#3a4048" label="Not relevant" />
-                </div>
-              </div>
-
-              <div>
-                <h4
-                  className="st-mono text-xs uppercase tracking-wider"
-                  style={{ color: "#8b929b" }}
-                >
-                  Categories
-                </h4>
-                <div className="mt-2 grid grid-cols-2 gap-1.5 text-xs" style={{ color: "#8b929b" }}>
-                  {(Object.keys(COLOUR_STYLES) as Array<keyof typeof COLOUR_STYLES>).map(
-                    (colour) => (
-                      <LegendRow
-                        key={colour}
-                        color={COLOUR_STYLES[colour].stroke}
-                        label={COLOUR_LABELS[colour]}
-                      />
-                    )
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
+        <div className="border-t pt-4" style={{ borderColor: "#262b31" }}>
+          <h3
+            className="st-mono text-xs uppercase tracking-wider"
+            style={{ color: "#8b929b" }}
+          >
+            Categories
+          </h3>
+          <div className="mt-2 grid grid-cols-2 gap-1.5 text-xs" style={{ color: "#8b929b" }}>
+            {(Object.keys(COLOUR_STYLES) as Array<keyof typeof COLOUR_STYLES>).map(
+              (colour) => (
+                <LegendRow
+                  key={colour}
+                  color={COLOUR_STYLES[colour].stroke}
+                  label={COLOUR_LABELS[colour]}
+                />
+              )
+            )}
+          </div>
         </div>
       </div>
     </div>
